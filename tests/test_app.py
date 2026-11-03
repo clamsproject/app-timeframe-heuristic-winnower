@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import app  # noqa: E402
 import winnow  # noqa: E402
 
-APP_URI_PREFIX = 'http://apps.clams.ai/timeframe-winnower'
+APP_URI_PREFIX = 'http://apps.clams.ai/timeframe-heuristic-winnower'
 DURATION = 300_000
 # Sources agree on boundaries at 60 s, 120 s, 180 s and 240 s; source "d"
 # dissents at 180 s, source "e" votes alone at 150 s.
@@ -34,14 +34,17 @@ def add_video(mmif: Mmif) -> Document:
 
 
 def add_timeframe_view(mmif: Mmif, app_name: str, spans, label='shot',
-                       unit='milliseconds'):
+                       unit='milliseconds', document='d1', labelset_uri=None):
     view = mmif.new_view()
     view.metadata.app = f'http://apps.clams.ai/{app_name}/v1'
-    view.new_contain(AnnotationTypes.TimeFrame, timeUnit=unit, document='d1')
+    view.new_contain(AnnotationTypes.TimeFrame, timeUnit=unit,
+                     document=document)
     for start, end in spans:
         props = dict(start=start, end=end)
         if label is not None:
             props['label'] = label
+        if labelset_uri is not None:
+            props['labelsetUri'] = labelset_uri
         view.new_annotation(AnnotationTypes.TimeFrame, **props)
     return view
 
@@ -158,20 +161,20 @@ class TestLabelFilter:
 
     def test_allow_list_drops_unlabeled(self, labeled_and_unlabeled):
         mmif, labeled, _ = labeled_and_unlabeled
-        events = app.timeframe_events(mmif, None, ['shot'], [], [])
-        assert set(events) == {labeled}
+        events = app.timeframe_events(mmif, ['shot'], [], set())
+        assert set(events['d1']) == {(labeled, '')}
 
     def test_ignore_list_keeps_unlabeled(self, labeled_and_unlabeled):
         mmif, _, unlabeled = labeled_and_unlabeled
-        events = app.timeframe_events(mmif, None, [], ['shot'], [])
-        assert set(events) == {unlabeled}
+        events = app.timeframe_events(mmif, [], ['shot'], set())
+        assert set(events['d1']) == {(unlabeled, '')}
 
 
 class TestApp:
 
     def test_boundaries_where_four_of_five_agree(self, winnower,
                                                  five_source_mmif):
-        out = run(winnower, five_source_mmif)
+        out = run(winnower, five_source_mmif, minAgreementRatio=['0.8'])
         segs = segments(out)
         starts = [s for s, _ in segs]
         assert starts[0] == 0
@@ -192,10 +195,13 @@ class TestApp:
                   for tf in view.get_annotations(AnnotationTypes.TimeFrame)}
         assert labels == {'segment'}
 
-    def test_too_few_sources_yields_nothing(self, winnower,
-                                            five_source_mmif):
-        out = run(winnower, five_source_mmif, minAgreement=['6'])
-        assert output_views(out) == []
+    def test_threshold_is_a_share_of_sources(self):
+        assert [app.agreement_threshold(0.5, n) for n in (1, 2, 3, 5)] == [
+            1, 1, 2, 3]
+        assert app.agreement_threshold(0.8, 5) == 4
+        assert app.agreement_threshold(0.6, 5) == 3
+        with pytest.raises(ValueError):
+            app.agreement_threshold(0, 5)
 
     def test_ignore_label_removes_a_voter(self, winnower):
         mmif = Mmif()
@@ -205,14 +211,23 @@ class TestApp:
             spans = events_to_spans([0] + events + [DURATION])
             add_timeframe_view(mmif, f'src-{name}', spans, label=label)
         mmif = reload(mmif)
-        with_d = segments(run(winnower, mmif, minAgreement=['4']))
-        without_d = segments(run(winnower, mmif, minAgreement=['4'],
+        with_d = segments(run(winnower, mmif, minAgreementRatio=['0.8']))
+        without_d = segments(run(winnower, mmif, minAgreementRatio=['0.8'],
                                  tfLabelIgnore=['speaker']))
         # with d voting, 60 s, 120 s and 240 s reach four votes; without d
         # no point does
         assert len(with_d) == 4
         assert len(without_d) == 1
         assert without_d == [(0, DURATION)]
+
+    def test_own_output_does_not_vote_by_default(self, winnower,
+                                                 five_source_mmif):
+        out = run(winnower, five_source_mmif, minAgreementRatio=['0.8'])
+        ignored = next(p.default for p in winnower.metadata.parameters
+                       if p.name == 'tfLabelIgnore')
+        events = app.timeframe_events(out, [], ignored, set())
+        assert len(events['d1']) == len(SOURCE_EVENTS)
+        assert (output_views(out)[0].id, '') not in events['d1']
 
     def test_seconds_unit_is_converted(self, winnower):
         mmif = Mmif()
@@ -221,7 +236,7 @@ class TestApp:
             spans = [(s / 1000, e / 1000)
                      for s, e in events_to_spans([0] + events + [DURATION])]
             add_timeframe_view(mmif, f'src-{name}', spans, unit='seconds')
-        out = run(winnower, reload(mmif))
+        out = run(winnower, reload(mmif), minAgreementRatio=['0.8'])
         starts = [s for s, _ in segments(out)][1:]
         assert len(starts) == 3
         assert all(isinstance(s, int) for s in starts)
@@ -242,13 +257,86 @@ class TestApp:
             add_timeframe_view(mmif, f'src-{name}',
                                events_to_spans([0, 60_000, 120_000, DURATION]))
         mmif = reload(mmif)
-        fps = None
-        sentence_events = app.sentence_events(mmif, fps)
-        assert list(sentence_events.values()) == [
+        sentence_events = app.sentence_events(mmif)
+        assert [sorted(ts) for ts in sentence_events['d1'].values()] == [
             [1_000, 60_000, 61_000, 120_000, 121_000, 200_000]]
-        tf_events = app.timeframe_events(mmif, fps, [], [], skip_views=[])
+        tf_events = app.timeframe_events(mmif, [], [], skip_views=set())
         # the ASR view's word-level frames never appear as TimeFrame events
-        assert set(tf_events) == {f'v_{i}' for i in range(1, 4)}
-        out = run(winnower, mmif, minAgreement=['4'])
+        assert set(tf_events['d1']) == {(f'v_{i}', '') for i in range(1, 4)}
+        out = run(winnower, mmif, minAgreementRatio=['1.0'])
         starts = [s for s, _ in segments(out)]
         assert len(starts) == 3
+
+    def test_output_carries_document_of_input(self, winnower,
+                                              five_source_mmif):
+        out = run(winnower, five_source_mmif)
+        view = output_views(out)[0]
+        documents = {tf.get_property('document')
+                     for tf in view.get_annotations(AnnotationTypes.TimeFrame)}
+        assert documents == {'d1'}
+
+    def test_no_document_object_is_needed(self, winnower):
+        mmif = Mmif()
+        for name, events in SOURCE_EVENTS.items():
+            spans = events_to_spans([0] + events + [DURATION])
+            add_timeframe_view(mmif, f'src-{name}', spans)
+        spans = segments(run(winnower, reload(mmif),
+                             minAgreementRatio=['0.8']))
+        # the length falls back to the latest event of the voting views
+        assert spans[-1][1] == DURATION
+        assert len(spans) == 4
+
+    def test_documents_are_winnowed_separately(self, winnower):
+        mmif = Mmif()
+        add_video(mmif)
+        for name, events in SOURCE_EVENTS.items():
+            spans = events_to_spans([0] + events + [DURATION])
+            add_timeframe_view(mmif, f'src-{name}', spans)
+        # three views on another document, at times d1 has no agreement on
+        for name in ('x', 'y', 'z'):
+            add_timeframe_view(
+                mmif, f'other-{name}',
+                events_to_spans([0, 150_000, 300_000]), document='d2')
+        out = run(winnower, reload(mmif), minAgreementRatio=['0.6'])
+        view = output_views(out)[0]
+        by_doc = {}
+        for tf in view.get_annotations(AnnotationTypes.TimeFrame):
+            by_doc.setdefault(tf.get_property('document'), []).append(
+                (tf.get_property('start'), tf.get_property('end')))
+        assert set(by_doc) == {'d1', 'd2'}
+        assert by_doc['d2'] == [(0, 150_000), (150_000, 300_000)]
+        assert all(150_000 not in span for span in by_doc['d1'])
+
+    def test_single_source_warns_and_still_segments(self, winnower):
+        mmif = Mmif()
+        add_video(mmif)
+        add_timeframe_view(mmif, 'lonely',
+                           events_to_spans([0, 100_000, DURATION]))
+        # annotate() records warnings in a separate view of the output; the
+        # ``run`` helper silences them, so call annotate() directly
+        with warnings.catch_warnings():
+            warnings.simplefilter('always')
+            out = Mmif(winnower.annotate(reload(mmif).serialize()))
+        assert any('not corroborated' in str(v.metadata.warnings)
+                   for v in out.views if v.has_warnings())
+        assert segments(out) == [(0, 100_000), (100_000, DURATION)]
+
+    def test_labelset_uri_splits_a_view_into_sources(self):
+        mmif = Mmif()
+        add_video(mmif)
+        view = add_timeframe_view(mmif, 'two-kinds', [(0, 60_000)],
+                                  labelset_uri='http://example.org/shots')
+        view.new_annotation(AnnotationTypes.TimeFrame, start=60_000,
+                            end=120_000, label='speech',
+                            labelsetUri='http://example.org/speech')
+        events = app.collect_events(reload(mmif), [], [])
+        assert set(events['d1']) == {
+            (view.id, 'http://example.org/shots'),
+            (view.id, 'http://example.org/speech')}
+
+    def test_timeframe_without_document_is_an_error(self, winnower):
+        mmif = Mmif()
+        add_video(mmif)
+        add_timeframe_view(mmif, 'x', [(0, 1000)], document=None)
+        with pytest.raises(ValueError, match='`document`'):
+            app.collect_events(mmif, [], [])

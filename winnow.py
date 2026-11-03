@@ -136,3 +136,15 @@ def segments_from_boundaries(boundaries: List[int],
     cuts = sorted({0, duration_ms,
                    *(t for t in boundaries if 0 < t < duration_ms)})
     return [(cuts[i], cuts[i + 1]) for i in range(len(cuts) - 1)]
+
+
+def winnow(events_by_source: Dict[str, List[int]], window_ms: int,
+           min_agreement: int, min_separation_ms: int,
+           duration_ms: int) -> List[Tuple[int, int]]:
+    """Run every step over one timeline: from the candidate events of each
+    source to ``(start, end)`` segments that tile ``[0, duration_ms]``."""
+    pieces = agreement_signal(events_by_source, window_ms)
+    candidates = candidates_from_signal(pieces, min_agreement)
+    boundaries = select_boundaries_dp(
+        candidates, min_separation_ms, duration_ms)
+    return segments_from_boundaries(boundaries, duration_ms)
